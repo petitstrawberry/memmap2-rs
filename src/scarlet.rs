@@ -9,8 +9,15 @@
 //! whole file into kernel memory and writes it back when unmapped, even if
 //! nothing was written; private mappings fault pages in from the file, and a
 //! read-only mapping cannot tell the two apart.
+//!
+//! Some filesystems cannot map files at all (the initramfs, and so the lower
+//! layer of an overlay root). A private mapping is then filled by reading the
+//! file into anonymous memory: it behaves the same, except that it never sees
+//! later changes to the file, which a private mapping need not either. The
+//! file's cursor is restored afterwards, as mapping never moves it. Shared
+//! mappings have no such fallback.
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 
 const MEMORY_MAP: usize = 700;
@@ -117,7 +124,46 @@ impl MmapInner {
     fn file(len: usize, file: &File, offset: u64, prot: usize, flags: usize) -> io::Result<Self> {
         let handle = usize::try_from(file.as_raw_fd())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid file handle"))?;
-        Self::new(len, prot, flags, handle, offset)
+        match Self::new(len, prot, flags, handle, offset) {
+            Err(error) if flags & MAP_PRIVATE != 0 => {
+                Self::copied(len, file, offset, prot).map_err(|_| error)
+            }
+            result => result,
+        }
+    }
+
+    /// A private mapping filled from the file, for files that cannot be mapped.
+    /// Bytes past the end of the file read as zero.
+    fn copied(len: usize, file: &File, offset: u64, prot: usize) -> io::Result<Self> {
+        let mut map = Self::new(
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            0,
+            0,
+        )?;
+        let mut reader = file;
+        let cursor = reader.stream_position()?;
+        reader.seek(SeekFrom::Start(offset))?;
+        // SAFETY: the anonymous mapping is writable and at least `len` bytes.
+        let mut buffer = unsafe { std::slice::from_raw_parts_mut(map.ptr, len) };
+        let filled = loop {
+            if buffer.is_empty() {
+                break Ok(());
+            }
+            match reader.read(buffer) {
+                Ok(0) => break Ok(()),
+                Ok(n) => buffer = &mut buffer[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        reader.seek(SeekFrom::Start(cursor))?;
+        filled?;
+        if prot & PROT_WRITE == 0 {
+            map.protect(prot)?;
+        }
+        Ok(map)
     }
 
     /// The page-aligned start and length of the whole mapping.
